@@ -22,7 +22,8 @@ with no power, the screen costs nothing between updates.
 | **3 Tides** | A 24-hour tide curve (6 hours back, 18 ahead) with a "now" marker, high and low times, and the next two events |
 
 **Buttons:** **BOOT** = next page, **PWR** = previous page, **hold BOOT for 2 seconds** = open the
-phone setup page. The display returns to the clock page by itself after 3 minutes.
+phone setup page, **hold PWR for 2 seconds** = power off (on a battery; see Battery). The display
+returns to the clock page by itself after 3 minutes.
 
 **Logging:** every 10 minutes (on the :00, :10, :20 … marks) it appends a reading to a small file
 in the board's flash (8 bytes per sample, about 8 KB a week) which feeds the graph, and, if a microSD
@@ -88,10 +89,37 @@ Waveshare's own demo repository:
 | I2C | SDA 47, SCL 48 (RTC 0x51, SHTC3 0x70, codec 0x18) |
 | microSD (1-bit SD_MMC) | CLK 39, CMD 41, D0 40 |
 | Buttons | BOOT 0, PWR 18 |
+| Battery voltage | GPIO 4 (ADC), through a 2:1 divider |
 
 `hardware_check/hardware_check.ino` is a small sketch that powers the rails, scans I2C, reads the
 sensor and RTC, and draws a test pattern. It's a quick way to confirm a board before flashing the
 clock.
+
+## Battery
+
+The board has a connector (MX1.25) and charger for a single-cell 3.7 V Li-ion/LiPo battery, charged
+over USB-C. The firmware:
+
+* shows a battery icon and percentage at the top right of the clock page. The percentage comes from
+  a rough open-circuit voltage curve, so it reads high while charging and sags under load. The icon
+  is hidden when no battery is connected (under about 2.5 V), and there is no charge-status
+  indicator because the board doesn't expose one;
+* holds the battery power latch (GPIO 17) high from the very first instruction, so a board powered
+  on with the PWR button stays on;
+* ignores a PWR press that was already held when it started, since that press is what powered the
+  board on;
+* powers off on a 2-second **PWR** hold, and automatically when the cell is empty (under 3.25 V for
+  3 consecutive minutes). Either way it first draws "Powered off" or "Battery empty" on the display,
+  which the e-paper keeps with no power. On USB power the latch has nothing to cut, so it just
+  carries on;
+* runs the CPU at 80 MHz. It stays awake and checks the clock every 40 ms, so a small cell lasts
+  hours to a day rather than days. Sleeping between minutes would help a great deal but would make
+  the USB serial port disappear while asleep.
+
+**Safety:** MX1.25 batteries from different sellers are not wired with the same polarity. Check the
+battery's red/black wires against the +/- markings on the board before connecting one, and use a
+cell with a built-in protection circuit. The firmware's empty-battery shutdown is a convenience, not
+a substitute for one.
 
 ## Build and flash
 
@@ -139,7 +167,9 @@ README photos were staged.
 * Connections to NOAA don't verify the server's TLS certificate (`setInsecure()`). The data is
   public and nothing secret is sent, but it means a man-in-the-middle could feed false tides.
 * The sensor reads warm because of the board's own heat. The offset is calibrated against one
-  reference point and will shift with enclosure, airflow and ambient temperature.
+  reference point and will shift with enclosure, airflow and ambient temperature. A battery packed
+  into the case next to the chip, or the case itself, changes the heat balance, so recalibrate with
+  the `O` command after the final assembly has warmed up.
 * The offset also assumes a steady load; Wi-Fi activity warms the sensor for a few minutes.
 * Tide predictions are astronomical predictions; storms and river flow can move the real water level.
 * Not a navigation or safety tool.

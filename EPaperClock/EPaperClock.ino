@@ -40,6 +40,7 @@
 #define I2C_SCL 48
 #define RTC_ADDR 0x51
 #define SHTC3_ADDR 0x70
+#define VBAT_ADC 4    // battery voltage through a 2:1 divider (ADC1 channel 3)
 #define SD_CLK 39
 #define SD_CMD 41
 #define SD_D0 40
@@ -134,6 +135,25 @@ static bool readSHTC3(float &t, float &rh) {
   return true;
 }
 
+// ---- battery ----
+int battMv = 0;  // millivolts at the cell; below ~2.5 V means no battery is connected
+static int readBatteryMv() {
+  analogSetPinAttenuation(VBAT_ADC, ADC_11db);
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) { sum += analogReadMilliVolts(VBAT_ADC); delay(2); }
+  return (int)(sum / 8) * 2;
+}
+// Rough Li-ion open-circuit curve. It reads high while charging and sags under load.
+static int battPercent(int mv) {
+  static const int V[] = {3300, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200};
+  static const int P[] = {0, 5, 12, 25, 45, 62, 78, 90, 100};
+  if (mv <= V[0]) return 0;
+  if (mv >= V[8]) return 100;
+  for (int i = 1; i < 9; i++)
+    if (mv <= V[i]) return P[i - 1] + (P[i] - P[i - 1]) * (mv - V[i - 1]) / (V[i] - V[i - 1]);
+  return 100;
+}
+
 // The sensor sits next to the SoC and reads warm. tempOffsetC (serial O command) corrects the
 // temperature; relative humidity is then re-derived for the corrected temperature, because the
 // same amount of water vapour is a higher percentage in cooler air (Magnus formula).
@@ -147,6 +167,7 @@ static void updateSensor() {
     curRH = constrain(100.0f * vapour / satPressure(ambient), 0.0f, 100.0f);
     curValid = true;
   }
+  battMv = readBatteryMv();
 }
 
 // ---- microSD CSV history ----
@@ -599,6 +620,31 @@ static void drawTidePage(Adafruit_GFX &g) {
   }
 }
 
+// ---- battery icon (top right of the clock page; hidden when no battery is connected) ----
+static void drawBattery(Adafruit_GFX &g) {
+  if (battMv < 2500) return;
+  int pc = battPercent(battMv);
+  g.drawRect(176, 3, 19, 9, INK);
+  g.fillRect(195, 5, 2, 5, INK);
+  int w = (15 * pc + 50) / 100;
+  if (w > 0) g.fillRect(178, 5, w, 5, INK);
+  char t[6];
+  snprintf(t, sizeof t, "%d%%", pc);
+  g.setFont();
+  g.setTextSize(1);
+  g.setTextColor(INK);
+  g.setCursor(176 - 6 * (int)strlen(t) - 3, 4);
+  g.print(t);
+}
+
+// ---- power-off / empty-battery message (e-paper keeps it on screen with no power) ----
+static const char *offLine1 = "Powered off";
+static const char *offLine2 = "Press PWR to start";
+static void drawOffPage(Adafruit_GFX &g) {
+  printCenter(g, &FreeSansBold12pt7b, 100, 92, offLine1);
+  printCenter(g, &FreeSans9pt7b, 100, 120, offLine2);
+}
+
 // ---- Wi-Fi setup screen ----
 static Adafruit_GFX *qrTarget = nullptr;
 static void qrDraw(esp_qrcode_handle_t qr) {
@@ -637,16 +683,20 @@ static void drawSetupPage(Adafruit_GFX &g) {
 }
 
 // ---- pages ----
-enum { PG_CLOCK = 0, PG_CLIMATE = 1, PG_TIDES = 2, PG_COUNT = 3, PG_SETUP = 9 };
+enum { PG_CLOCK = 0, PG_CLIMATE = 1, PG_TIDES = 2, PG_COUNT = 3, PG_OFF = 8, PG_SETUP = 9 };
 static int page = PG_CLOCK;
 
 static void drawPage(Adafruit_GFX &g, int pg) {
   g.setRotation(ROTATION);
   g.fillScreen(PAPER);
   if (pg == PG_SETUP) drawSetupPage(g);
+  else if (pg == PG_OFF) drawOffPage(g);
   else if (pg == PG_CLIMATE) drawClimatePage(g);
   else if (pg == PG_TIDES) drawTidePage(g);
-  else drawClockPage(g);
+  else {
+    drawClockPage(g);
+    drawBattery(g);
+  }
 }
 
 static void render(int pg, bool full) {
@@ -654,6 +704,19 @@ static void render(int pg, bool full) {
   else display.setPartialWindow(0, 0, 200, 200);
   display.firstPage();
   do { drawPage(display, pg); } while (display.nextPage());
+}
+
+// Shows a message, then releases the battery latch. On a battery the board powers down and the
+// e-paper keeps the message; on USB the board stays up, so it just carries on.
+static void powerOff(const char *l1, const char *l2) {
+  Serial.printf("power off: %s\n", l1);
+  offLine1 = l1;
+  offLine2 = l2;
+  render(PG_OFF, true);
+  delay(500);
+  digitalWrite(VBAT_LATCH, LOW);
+  delay(2500);
+  settingsDirty = true;
 }
 
 // Serial screenshot of what a page looks like (e-paper cannot be read back, so this draws the
@@ -810,9 +873,9 @@ static void handleSerial() {
     } else if (k == '?') {
       String ssid, pass;
       bool have = loadCreds(ssid, pass);
-      Serial.printf("time source %d, tz %s, %s, %s, wifi %s, tide %s (%s), log %u rows, sd %s, temp %.1fC %.0f%%\n", (int)timeSource,
+      Serial.printf("time source %d, tz %s, %s, %s, wifi %s, tide %s (%s), log %u rows, sd %s, temp %.1fC %.0f%%, battery %d mV (%d%%)\n", (int)timeSource,
                     tzString.c_str(), hour24Format ? "24h" : "12h", useFahrenheit ? "F" : "C", have ? ssid.c_str() : "(none)",
-                    tideStation.c_str(), tideName.c_str(), (unsigned)logCount(), sdOk ? "ok" : "none", curT, curRH);
+                    tideStation.c_str(), tideName.c_str(), (unsigned)logCount(), sdOk ? "ok" : "none", curT, curRH, battMv, battMv < 2500 ? 0 : battPercent(battMv));
     }
     line = "";
   }
@@ -823,7 +886,13 @@ static void pollButtons() {
   static const int pins[2] = {BOOT_BTN, PWR_BTN};
   static uint32_t downAt[2] = {0, 0};
   static bool down[2] = {false, false}, fired[2] = {false, false};
+  static bool started = false;
   uint32_t t = millis();
+  if (!started) {  // a button already held at boot (PWR powers the board on) must not count as a press
+    started = true;
+    for (int i = 0; i < 2; i++)
+      if (digitalRead(pins[i]) == LOW) { down[i] = true; fired[i] = true; downAt[i] = t; }
+  }
   for (int i = 0; i < 2; i++) {
     bool pressed = digitalRead(pins[i]) == LOW;
     if (pressed && !down[i]) {
@@ -833,6 +902,7 @@ static void pollButtons() {
     } else if (pressed && !fired[i] && t - downAt[i] > 2000) {
       fired[i] = true;
       if (i == 0 && !setupActive) requestSetup();
+      if (i == 1 && !setupActive) powerOff("Powered off", "Press PWR to start");
     } else if (!pressed && down[i]) {
       down[i] = false;
       if (!fired[i] && t - downAt[i] > 40 && !setupActive) {
@@ -846,6 +916,7 @@ static void pollButtons() {
 
 // ---- main ----
 void setup() {
+  pinMode(VBAT_LATCH, OUTPUT); digitalWrite(VBAT_LATCH, HIGH);  // first: keeps a battery-started board alive
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);  // never stall the display if nothing is reading the port
   setCpuFrequencyMhz(80);    // plenty for a clock, and the chip runs cooler next to the sensor
@@ -943,6 +1014,15 @@ void loop() {
     bool sampleDue = lt.tm_min % LOG_INTERVAL_MIN == 0 || firstTick;
     if (sampleDue) takeSample(now);
     else updateSensor();
+    static int lowCount = 0;
+    if (battMv >= 2500 && battMv < 3250) {  // empty cell (a reading under 2.5 V means no battery)
+      if (++lowCount >= 3) {
+        lowCount = 0;
+        powerOff("Battery empty", "Charge, then press PWR");
+      }
+    } else {
+      lowCount = 0;
+    }
     if (page == PG_CLOCK) {
       needRender = true;
       if (++partials >= LOG_INTERVAL_MIN) { needFull = true; }
